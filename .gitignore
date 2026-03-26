@@ -151,3 +151,7 @@ data/
 # Rollout videos and wandb logs
 rollouts/
 wandb/
+
+*.whl
+job_log*.out
+experiments/logs/
