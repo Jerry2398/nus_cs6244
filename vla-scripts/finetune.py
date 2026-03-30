@@ -35,7 +35,7 @@ from experiments.robot.openvla_utils import (
 )
 
 from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
-from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
+from prismatic.extern.hf.modeling_prismatic import ObjectAwareCrossAttention, OpenVLAForActionPrediction
 from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
 from prismatic.models.action_heads import DiffusionActionHead, L1RegressionActionHead
 from prismatic.models.backbones.llm.prompting import PurePromptBuilder
@@ -83,6 +83,12 @@ class FinetuneConfig:
     use_film: bool = False                           # If True, uses FiLM to infuse language inputs into visual features
     num_images_in_input: int = 1                     # Number of images in the VLA input (default: 1)
     use_proprio: bool = False                        # If True, includes robot proprioceptive state in input
+
+    # Object-aware cross-attention (Helping Hands-style)
+    use_object_aware: bool = False                   # If True, adds learnable query tokens + cross-attention for object awareness
+    object_aware_num_queries: int = 2                # Number of learnable query tokens (e.g. 2 for hand + object)
+    object_aware_num_heads: int = 8                  # Number of attention heads in cross-attention layer
+    object_aware_fusion: str = "prefix"              # "prefix" = append to visual tokens (Option 1); "action_head" = fuse into action head (Option 2)
 
     # Training configuration
     batch_size: int = 8                              # Batch size per device (total batch size = batch_size * num GPUs)
@@ -281,6 +287,8 @@ def run_forward_pass(
     num_patches,
     compute_diffusion_l1=False,
     num_diffusion_steps_train=None,
+    object_aware_module=None,
+    object_aware_fusion="prefix",
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
     Compute model forward pass and metrics for both training and validation.
@@ -337,6 +345,8 @@ def run_forward_pass(
             noisy_action_projector=noisy_action_projector if use_diffusion else None,
             diffusion_timestep_embeddings=diffusion_timestep_embeddings if use_diffusion else None,
             use_film=use_film,
+            object_aware_module=object_aware_module,
+            object_aware_fusion=object_aware_fusion,
         )
 
     # Get action masks needed for logging
@@ -384,8 +394,16 @@ def run_forward_pass(
         )  # (B, act_chunk_len, D)
 
         if use_l1_regression:
+            # [Object-Aware Option 2] Concatenate object embeddings to action hidden states
+            if object_aware_fusion == "action_head" and output.object_embeddings is not None:
+                obj_expanded = output.object_embeddings.expand(-1, actions_hidden_states.shape[1], -1)
+                actions_hidden_states_for_head = torch.cat(
+                    [actions_hidden_states, obj_expanded], dim=-1
+                )
+            else:
+                actions_hidden_states_for_head = actions_hidden_states
             # Predict action
-            predicted_actions = action_head.module.predict_action(actions_hidden_states)
+            predicted_actions = action_head.module.predict_action(actions_hidden_states_for_head)
             # Get full L1 loss
             loss = torch.nn.L1Loss()(ground_truth_actions, predicted_actions)
 
@@ -413,6 +431,8 @@ def run_forward_pass(
                         next_actions_mask=next_actions_mask,
                         use_proprio=use_proprio,
                         use_film=use_film,
+                        object_aware_module=object_aware_module,
+                        object_aware_fusion=object_aware_fusion,
                     )
 
         metrics.update(
@@ -455,6 +475,8 @@ def run_diffusion_sampling(
     next_actions_mask,
     use_proprio,
     use_film,
+    object_aware_module=None,
+    object_aware_fusion="prefix",
 ) -> torch.Tensor:
     """
     Run diffusion sampling (reverse diffusion) to generate actions.
@@ -511,6 +533,8 @@ def run_diffusion_sampling(
                 noisy_action_projector=noisy_action_projector,
                 diffusion_timestep_embeddings=diffusion_timestep_embeddings,
                 use_film=use_film,
+                object_aware_module=object_aware_module,
+                object_aware_fusion=object_aware_fusion,
             )
             # Get last layer hidden states
             last_hidden_states = output.hidden_states[-1]  # (B, seq_len, D)
@@ -582,6 +606,7 @@ def save_training_checkpoint(
     action_head,
     train_dataset,
     distributed_state,
+    object_aware_module=None,
 ) -> None:
     """
     Save all training checkpoints including model components, LoRA adapter, and dataset statistics.
@@ -639,6 +664,11 @@ def save_training_checkpoint(
         if (cfg.use_l1_regression or cfg.use_diffusion) and action_head is not None:
             torch.save(action_head.state_dict(), checkpoint_dir / f"action_head--{checkpoint_name_suffix}")
 
+        if cfg.use_object_aware and object_aware_module is not None:
+            torch.save(
+                object_aware_module.state_dict(), checkpoint_dir / f"object_aware_module--{checkpoint_name_suffix}"
+            )
+
         if cfg.use_film:
             # To be safe, just save the entire vision backbone (not just FiLM components)
             torch.save(
@@ -678,6 +708,7 @@ def run_validation(
     log_step,
     distributed_state,
     val_time_limit,
+    object_aware_module=None,
 ) -> None:
     """
     Compute validation set metrics for logging.
@@ -724,6 +755,8 @@ def run_validation(
                 num_patches=num_patches,
                 compute_diffusion_l1=True,
                 num_diffusion_steps_train=cfg.num_diffusion_steps_train if cfg.use_diffusion else None,
+                object_aware_module=object_aware_module,
+                object_aware_fusion=cfg.object_aware_fusion,
             )
 
             # Add the loss value to the metrics
@@ -871,6 +904,21 @@ def finetune(cfg: FinetuneConfig) -> None:
             vla.model.vision_backbone.load_state_dict(state_dict)
         vla.model.vision_backbone = vla.model.vision_backbone.to(device_id)
 
+    # [Object-Aware] Instantiate cross-attention module if requested
+    if cfg.use_object_aware:
+        object_aware_module = init_module(
+            ObjectAwareCrossAttention,
+            "object_aware_module",
+            cfg,
+            device_id,
+            {
+                "llm_dim": vla.llm_dim,
+                "num_queries": cfg.object_aware_num_queries,
+                "num_heads": cfg.object_aware_num_heads,
+            },
+            to_bf16=True,
+        )
+
     # Wrap VLA with DDP
     vla = wrap_ddp(vla, device_id, find_unused=True)
 
@@ -886,12 +934,15 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # If applicable, instantiate continuous action head for L1 regression
     if cfg.use_l1_regression:
+        action_head_input_dim = vla.module.llm_dim
+        if cfg.use_object_aware and cfg.object_aware_fusion == "action_head":
+            action_head_input_dim = vla.module.llm_dim + vla.module.llm_dim
         action_head = init_module(
             L1RegressionActionHead,
             "action_head",
             cfg,
             device_id,
-            {"input_dim": vla.module.llm_dim, "hidden_dim": vla.module.llm_dim, "action_dim": ACTION_DIM},
+            {"input_dim": action_head_input_dim, "hidden_dim": vla.module.llm_dim, "action_dim": ACTION_DIM},
             to_bf16=True,
         )
 
@@ -919,6 +970,9 @@ def finetune(cfg: FinetuneConfig) -> None:
     # If we have proprio inputs, a single proprio embedding is appended to the end of the vision patch embeddings
     if cfg.use_proprio:
         NUM_PATCHES += 1
+    # If using object-aware prefix fusion (Option 1), query tokens are appended to patch embeddings
+    if cfg.use_object_aware and cfg.object_aware_fusion == "prefix":
+        NUM_PATCHES += cfg.object_aware_num_queries
     # For diffusion, a single diffusion timestep embedding is appended to the end of the vision patch embeddings
     if cfg.use_diffusion:
         NUM_PATCHES += 1
@@ -931,6 +985,8 @@ def finetune(cfg: FinetuneConfig) -> None:
         trainable_params += [param for param in noisy_action_projector.parameters() if param.requires_grad]
     if cfg.use_proprio:
         trainable_params += [param for param in proprio_projector.parameters() if param.requires_grad]
+    if cfg.use_object_aware:
+        trainable_params += [param for param in object_aware_module.parameters() if param.requires_grad]
     print(f"# total trainable params: {sum(p.numel() for p in trainable_params)}")
     optimizer = AdamW(trainable_params, lr=cfg.learning_rate)
 
@@ -1050,6 +1106,8 @@ def finetune(cfg: FinetuneConfig) -> None:
                 num_patches=NUM_PATCHES,
                 compute_diffusion_l1=compute_diffusion_l1,
                 num_diffusion_steps_train=cfg.num_diffusion_steps_train if cfg.use_diffusion else None,
+                object_aware_module=object_aware_module if cfg.use_object_aware else None,
+                object_aware_fusion=cfg.object_aware_fusion,
             )
 
             # Normalize loss to account for gradient accumulation
@@ -1111,6 +1169,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                     action_head=action_head if (cfg.use_l1_regression or cfg.use_diffusion) else None,
                     train_dataset=train_dataset,
                     distributed_state=distributed_state,
+                    object_aware_module=object_aware_module if cfg.use_object_aware else None,
                 )
 
             # Test model on validation set
@@ -1128,6 +1187,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                     log_step=log_step,
                     distributed_state=distributed_state,
                     val_time_limit=cfg.val_time_limit,
+                    object_aware_module=object_aware_module if cfg.use_object_aware else None,
                 )
                 # Set model back to training mode after validation
                 vla.train()

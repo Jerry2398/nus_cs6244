@@ -262,6 +262,76 @@ class PrismaticProjector(nn.Module):
         return projected_features
 
 
+# === Object-Aware Cross-Attention Module (Helping Hands-style) ===
+class ObjectAwareCrossAttention(nn.Module):
+    """
+    Learnable query tokens + cross-attention over projected visual patch embeddings,
+    inspired by "Helping Hands: An Object-Aware Ego-Centric Video Recognition Model"
+    (https://arxiv.org/abs/2308.07918).
+
+    A small set of learnable queries (e.g. "hand", "object") attend to the visual
+    patch sequence via multi-head cross-attention to produce object-aware embeddings.
+    These can be injected into the LLM token sequence (Option 1, default) or fused
+    directly into the action head (Option 2).
+
+    Args:
+        llm_dim: Hidden dimension matching the LLM embedding space.
+        num_queries: Number of learnable query tokens (e.g. 2 for hand+object).
+        num_heads: Number of attention heads in the cross-attention layer.
+        dropout: Dropout probability applied to the attention weights.
+    """
+
+    def __init__(
+        self,
+        llm_dim: int,
+        num_queries: int = 2,
+        num_heads: int = 8,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.llm_dim = llm_dim
+        self.num_queries = num_queries
+
+        self.query_tokens = nn.Parameter(torch.empty(1, num_queries, llm_dim))
+        nn.init.trunc_normal_(self.query_tokens, std=0.02)
+
+        self.query_norm = nn.LayerNorm(llm_dim)
+        self.kv_norm = nn.LayerNorm(llm_dim)
+
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=llm_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+
+        self.out_proj = nn.Sequential(
+            nn.LayerNorm(llm_dim),
+            nn.Linear(llm_dim, llm_dim),
+            nn.GELU(),
+            nn.Linear(llm_dim, llm_dim),
+        )
+
+    def forward(self, projected_patch_embeddings: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            projected_patch_embeddings: (B, num_patches, llm_dim) — already in LLM space.
+
+        Returns:
+            object_embeddings: (B, num_queries, llm_dim)
+        """
+        B = projected_patch_embeddings.shape[0]
+        queries = self.query_tokens.expand(B, -1, -1)
+
+        q = self.query_norm(queries)
+        kv = self.kv_norm(projected_patch_embeddings)
+
+        attn_out, _ = self.cross_attn(query=q, key=kv, value=kv)
+        object_embeddings = self.out_proj(attn_out) + queries
+
+        return object_embeddings
+
+
 # === Main HF Class Definitions ===
 @dataclass
 class PrismaticCausalLMOutputWithPast(ModelOutput):
@@ -275,6 +345,7 @@ class PrismaticCausalLMOutputWithPast(ModelOutput):
 
     # Additions for VLMs
     projector_features: Optional[torch.FloatTensor] = None
+    object_embeddings: Optional[torch.FloatTensor] = None
 
 
 class PrismaticPreTrainedModel(PreTrainedModel):
@@ -458,6 +529,30 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             return torch.cat((projected_patch_embeddings, proprio_features), dim=1)
         return projected_patch_embeddings
 
+    def _process_object_aware_features(
+        self, projected_patch_embeddings, object_aware_module, object_aware_fusion
+    ):
+        """Run object-aware cross-attention over visual patches.
+
+        Returns:
+            If object_aware_fusion == "prefix" (Option 1, default):
+                projected_patch_embeddings with object tokens appended.
+            If object_aware_fusion == "action_head":
+                a tuple (projected_patch_embeddings_unchanged, object_embeddings).
+        """
+        if object_aware_module is None:
+            return projected_patch_embeddings, None
+
+        object_embeddings = object_aware_module(projected_patch_embeddings)
+
+        if object_aware_fusion == "prefix":
+            projected_patch_embeddings = torch.cat(
+                (projected_patch_embeddings, object_embeddings), dim=1
+            )
+            return projected_patch_embeddings, None
+        else:
+            return projected_patch_embeddings, object_embeddings
+
     def _build_multimodal_attention(self, input_embeddings, projected_patch_embeddings, attention_mask):
         """Build multimodal embeddings and attention mask"""
         # Update attention mask
@@ -515,6 +610,8 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         noisy_action_projector=None,
         diffusion_timestep_embeddings=None,
         use_film: bool = False,
+        object_aware_module=None,
+        object_aware_fusion: str = "prefix",
     ) -> Union[Tuple, PrismaticCausalLMOutputWithPast]:
         """Run a forward pass through the VLM, returning a PrismaticCausalLMOutputWithPast instance."""
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -529,6 +626,7 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
 
         # Instantiate Placeholder for Projector Features
         projected_patch_embeddings = None
+        object_embeddings = None
 
         # === Handle Generation with Cache (`input_ids.shape[1] == 1`) =>> requires `past_keys_values` ===
         if input_ids.shape[1] == 1:
@@ -588,6 +686,11 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             # Add proprioceptive state if provided
             projected_patch_embeddings = self._process_proprio_features(
                 projected_patch_embeddings, proprio, proprio_projector
+            )
+
+            # [Object-Aware] Run cross-attention queries over visual patches
+            projected_patch_embeddings, object_embeddings = self._process_object_aware_features(
+                projected_patch_embeddings, object_aware_module, object_aware_fusion
             )
 
             # [Diffusion] Add diffusion timestep embedding if provided
@@ -672,6 +775,7 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             hidden_states=language_model_output.hidden_states,
             attentions=language_model_output.attentions,
             projector_features=projected_patch_embeddings,
+            object_embeddings=object_embeddings,
         )
 
     # === GenerationMixin Methods ===
@@ -884,6 +988,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         NUM_PATCHES,
         NUM_PROMPT_TOKENS,
         action_head=None,
+        object_embeddings=None,
     ):
         """Run L1 regression-based continuous action prediction or discrete action tokens prediction."""
         # Zero out action token embeddings
@@ -919,8 +1024,15 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
 
         # Handle different prediction methods
         if action_head is not None:
-            # L1 regression prediction
-            normalized_actions = action_head.predict_action(actions_hidden_states)
+            if object_embeddings is not None:
+                # Option 2 ("action_head" fusion): concat object embeddings to action hidden states
+                obj_expanded = object_embeddings.expand(-1, actions_hidden_states.shape[1], -1)
+                actions_hidden_states_for_head = torch.cat(
+                    [actions_hidden_states, obj_expanded], dim=-1
+                )
+                normalized_actions = action_head.predict_action(actions_hidden_states_for_head)
+            else:
+                normalized_actions = action_head.predict_action(actions_hidden_states)
             normalized_actions = normalized_actions.reshape(NUM_ACTIONS_CHUNK, ACTION_DIM)
             normalized_actions = normalized_actions.float().cpu().detach().numpy()
         else:
@@ -950,6 +1062,8 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         action_head=None,
         noisy_action_projector=None,
         use_film: bool = False,
+        object_aware_module=None,
+        object_aware_fusion: str = "prefix",
         **kwargs: str,
     ) -> np.ndarray:
         """Predict actions from input sequence, with options for different prediction methods.
@@ -1010,6 +1124,12 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                 projected_patch_embeddings, proprio, proprio_projector
             )
 
+        # [Object-Aware] Run cross-attention queries over visual patches
+        use_object_aware = object_aware_module is not None
+        projected_patch_embeddings, object_embeddings = self._process_object_aware_features(
+            projected_patch_embeddings, object_aware_module, object_aware_fusion
+        )
+
         # Use diffusion if provided, otherwise use regression or discrete prediction
         use_diffusion = noisy_action_projector is not None and hasattr(action_head, "noise_scheduler")
 
@@ -1017,6 +1137,8 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         NUM_PATCHES = self.vision_backbone.get_num_patches() * self.vision_backbone.get_num_images_in_input()
         if use_proprio:
             NUM_PATCHES += 1
+        if use_object_aware and object_aware_fusion == "prefix":
+            NUM_PATCHES += object_aware_module.num_queries
         if use_diffusion:
             NUM_PATCHES += 1
 
@@ -1050,6 +1172,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                 NUM_PATCHES,
                 NUM_PROMPT_TOKENS,
                 action_head,
+                object_embeddings=object_embeddings,
             )
 
         # Unnormalize predicted actions

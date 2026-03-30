@@ -22,7 +22,7 @@ from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq,
 json_numpy.patch()
 
 from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
-from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
+from prismatic.extern.hf.modeling_prismatic import ObjectAwareCrossAttention, OpenVLAForActionPrediction
 from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
 from prismatic.models.action_heads import DiffusionActionHead, L1RegressionActionHead
 from prismatic.models.film_vit_wrapper import FiLMedPrismaticVisionBackbone
@@ -517,6 +517,31 @@ def get_action_head(cfg: Any, llm_dim: int) -> Union[L1RegressionActionHead, Dif
     return action_head
 
 
+def get_object_aware_module(cfg: Any, llm_dim: int) -> ObjectAwareCrossAttention:
+    """
+    Get object-aware cross-attention module for eval.
+
+    Args:
+        cfg: Configuration object with model parameters
+        llm_dim: Dimension of the language model
+
+    Returns:
+        ObjectAwareCrossAttention: The initialized module
+    """
+    module = ObjectAwareCrossAttention(
+        llm_dim=llm_dim,
+        num_queries=cfg.object_aware_num_queries,
+        num_heads=cfg.object_aware_num_heads,
+    ).to(torch.bfloat16).to(DEVICE)
+    module.eval()
+
+    checkpoint_path = find_checkpoint_file(cfg.pretrained_checkpoint, "object_aware_module")
+    state_dict = load_component_state_dict(checkpoint_path)
+    module.load_state_dict(state_dict)
+
+    return module
+
+
 def resize_image_for_policy(img: np.ndarray, resize_size: Union[int, Tuple[int, int]]) -> np.ndarray:
     """
     Resize an image to match the policy's expected input size.
@@ -722,6 +747,8 @@ def get_vla_action(
     proprio_projector: Optional[torch.nn.Module] = None,
     noisy_action_projector: Optional[torch.nn.Module] = None,
     use_film: bool = False,
+    object_aware_module: Optional[torch.nn.Module] = None,
+    object_aware_fusion: str = "prefix",
 ) -> List[np.ndarray]:
     """
     Generate action predictions with the VLA policy.
@@ -780,7 +807,13 @@ def get_vla_action(
         # Generate action
         if action_head is None:
             # Standard VLA output (single-image inputs, discrete actions)
-            action, _ = vla.predict_action(**inputs, unnorm_key=cfg.unnorm_key, do_sample=False)
+            action, _ = vla.predict_action(
+                **inputs,
+                unnorm_key=cfg.unnorm_key,
+                do_sample=False,
+                object_aware_module=object_aware_module,
+                object_aware_fusion=object_aware_fusion,
+            )
         else:
             # Custom action head for continuous actions
             action, _ = vla.predict_action(
@@ -792,6 +825,8 @@ def get_vla_action(
                 noisy_action_projector=noisy_action_projector,
                 action_head=action_head,
                 use_film=use_film,
+                object_aware_module=object_aware_module,
+                object_aware_fusion=object_aware_fusion,
             )
 
     # Return action chunk as list of actions

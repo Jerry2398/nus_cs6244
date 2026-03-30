@@ -106,6 +106,8 @@ def get_action(
     proprio_projector: Optional[torch.nn.Module] = None,
     noisy_action_projector: Optional[torch.nn.Module] = None,
     use_film: bool = False,
+    object_aware_module: Optional[torch.nn.Module] = None,
+    object_aware_fusion: str = "prefix",
 ) -> Union[List[np.ndarray], np.ndarray]:
     """
     Query the model to get action predictions.
@@ -139,6 +141,8 @@ def get_action(
                 proprio_projector=proprio_projector,
                 noisy_action_projector=noisy_action_projector,
                 use_film=use_film,
+                object_aware_module=object_aware_module,
+                object_aware_fusion=object_aware_fusion,
             )
         else:
             raise ValueError(f"Unsupported model family: {cfg.model_family}")

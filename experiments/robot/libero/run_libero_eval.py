@@ -34,6 +34,7 @@ from experiments.robot.libero.libero_utils import (
 from experiments.robot.openvla_utils import (
     get_action_head,
     get_noisy_action_projector,
+    get_object_aware_module,
     get_processor,
     get_proprio_projector,
     resize_image_for_policy,
@@ -95,6 +96,12 @@ class GenerateConfig:
     use_film: bool = False                           # If True, uses FiLM to infuse language inputs into visual features
     num_images_in_input: int = 2                     # Number of images in the VLA input (default: 1)
     use_proprio: bool = True                         # Whether to include proprio state in input
+
+    # Object-aware cross-attention (Helping Hands-style)
+    use_object_aware: bool = False                   # If True, loads object-aware cross-attention module
+    object_aware_num_queries: int = 2                # Number of learnable query tokens
+    object_aware_num_heads: int = 8                  # Number of attention heads in cross-attention
+    object_aware_fusion: str = "prefix"              # "prefix" or "action_head"
 
     center_crop: bool = True                         # Center crop? (if trained w/ random crop image aug)
     num_open_loop_steps: int = 8                     # Number of actions to execute open-loop before requerying policy
@@ -167,13 +174,18 @@ def initialize_model(cfg: GenerateConfig):
     if cfg.use_diffusion:
         noisy_action_projector = get_noisy_action_projector(cfg, model.llm_dim)
 
+    # Load object-aware module if needed
+    object_aware_module = None
+    if cfg.use_object_aware:
+        object_aware_module = get_object_aware_module(cfg, model.llm_dim)
+
     # Get OpenVLA processor if needed
     processor = None
     if cfg.model_family == "openvla":
         processor = get_processor(cfg)
         check_unnorm_key(cfg, model)
 
-    return model, action_head, proprio_projector, noisy_action_projector, processor
+    return model, action_head, proprio_projector, noisy_action_projector, processor, object_aware_module
 
 
 def check_unnorm_key(cfg: GenerateConfig, model) -> None:
@@ -338,6 +350,8 @@ def run_episode(
                     proprio_projector=proprio_projector,
                     noisy_action_projector=noisy_action_projector,
                     use_film=cfg.use_film,
+                    object_aware_module=object_aware_module,
+                    object_aware_fusion=cfg.object_aware_fusion,
                 )
                 action_queue.extend(actions)
 
@@ -469,7 +483,7 @@ def eval_libero(cfg: GenerateConfig) -> float:
     set_seed_everywhere(cfg.seed)
 
     # Initialize model and components
-    model, action_head, proprio_projector, noisy_action_projector, processor = initialize_model(cfg)
+    model, action_head, proprio_projector, noisy_action_projector, processor, object_aware_module = initialize_model(cfg)
 
     # Get expected image dimensions
     resize_size = get_image_resize_size(cfg)
