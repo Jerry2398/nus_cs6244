@@ -1,0 +1,25 @@
+root keys: ['data']
+data keys: ['demo_0_20260414_124303']
+
+demo key: demo_0_20260414_124303
+demo keys: ['actions', 'dones', 'obs', 'rewards4dist', 'rewards4done', 'rewards4overlap', 'robot_states']
+attrs: {'num_samples': 181}
+
+OBS:
+  agentview_contact: shape=(181, 256, 256), dtype=uint8
+  agentview_rgb: shape=(181, 256, 256, 3), dtype=uint8
+  agentview_seg: shape=(181, 256, 256), dtype=uint8
+  ee_ori: shape=(181, 3), dtype=float64
+  ee_pos: shape=(181, 3), dtype=float64
+  ee_states: shape=(181, 6), dtype=float64
+  gripper_states: shape=(181, 2), dtype=float64
+  joint_states: shape=(181, 7), dtype=float64
+  states: shape=(181, 38), dtype=float64
+
+EPISODE:
+  actions: shape=(181, 7), dtype=float64
+  dones: shape=(181,), dtype=uint8
+  rewards4dist: shape=(181,), dtype=float64
+  rewards4done: shape=(181,), dtype=int64
+  rewards4overlap: shape=(174,), dtype=int64
+  robot_states: shape=(181, 9), dtype=float64

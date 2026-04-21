@@ -1,0 +1,24 @@
+root: dict (1 keys)
+  open_the_top_drawer_of_the_cabinet_and_give_the_bowl_to_the_person: dict (1 keys)
+    0_20260414_124303: dict (6 keys)
+      success: bool = True
+      initial_state: list (len=38)
+        └─ element type: float
+          [0]: float = 0.0
+      initial_state_seed: int = 781334
+      task_nouns: list (len=1)
+        └─ element type: str
+          [0]: str = 'robot'
+      task_description: str = 'open the top drawer of the cabinet and give the bowl to the person'
+      exo_boxes: list (len=181)
+        └─ element type: dict
+          [0]: dict (3 keys)
+            robot: list (len=2)
+              └─ element type: int
+                [0]: int = 100
+            cabinet 1: list (len=2)
+              └─ element type: int
+                [0]: int = 120
+            human: list (len=2)
+              └─ element type: int
+                [0]: int = 250
