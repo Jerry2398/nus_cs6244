@@ -163,7 +163,9 @@ def load_smolvla(
     device: str = 'cpu',
     checkpoint_keys_mapping: str = '',
 ) -> torch.nn.Module:
-    state_dict = safetensors.torch.load_file(filename, device=device)
+    print(f'  Reading safetensors from disk...')
+    state_dict = safetensors.torch.load_file(filename, device='cpu')
+    print(f'  Processing {len(state_dict)} weight tensors...')
 
     # Optional user-supplied renames (e.g. "model._orig_mod.//model.")
     if checkpoint_keys_mapping and '//' in checkpoint_keys_mapping:
@@ -409,9 +411,6 @@ class SmolVLAPolicy(PreTrainedPolicy):
         map_location: str,
         strict: bool,
     ):
-        safetensors.torch.load_model(
-            model, model_file, strict=strict, device=map_location
-        )
         return load_smolvla(
             model,
             model_file,

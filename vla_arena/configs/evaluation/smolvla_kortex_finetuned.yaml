@@ -1,0 +1,28 @@
+policy_path: "/scratch/yuchen.yan/smol_vla/outputs/train/smolvla_kortex/checkpoints/last/pretrained_model"
+
+# --- VLA-Arena environment-specific parameters ---
+task_suite_name: "safety_dynamic_obstacles"
+task_level: 0
+num_steps_wait: 10
+num_trials_per_task: 10
+init_state_selection_mode: "first"
+init_state_offset: 0
+init_state_offset_random: false
+
+# --- Evaluation arguments ---
+device: "cuda"
+
+seed: 1000
+result_json_path: "/scratch/yuchen.yan/smol_vla/outputs/eval/smolvla_kortex_eval.json"
+
+save_video_mode: "first_success_failure"
+add_noise: false
+randomize_color: false
+adjust_light: false
+camera_offset: false
+use_local_log: true
+
+replacements_file: "VLA-Arena/language_replacements"
+use_replacements: false
+replacement_probability: 1.0
+replacement_level: 1

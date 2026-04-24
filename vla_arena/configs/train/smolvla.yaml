@@ -1,10 +1,10 @@
 dataset:
-  repo_id: "VLA-Arena/VLA_Arena_L0_L_lerobot_smolvla"
-  root: "/path/to/your/datasets/vla-arena-lerobot"
+  repo_id: "real_kortex_lerobot_v21"
+  root: "/scratch/yuchen.yan/smol_vla/datasets/real_kortex_lerobot_v21"
 
 policy:
   type: "smolvla"
-  pretrained_path: "/path/to/your/models/smolvla"
+  pretrained_path: "/scratch/yuchen.yan/smol_vla/models/smolvla_base"
   device: "cuda"
   optimizer_lr: 1e-4
   scheduler_warmup_steps: 1000
@@ -12,11 +12,14 @@ policy:
 
 batch_size: 64
 steps: 100000
-output_dir: "outputs/train/smolvla_finetuned"
-job_name: "smolvla_finetuning_on_vla_arena"
+output_dir: "/scratch/yuchen.yan/smol_vla/outputs/train/smolvla_kortex_finetune_v1"
+job_name: "smolvla_finetuning_on_kortex"
 save_checkpoint: true
 save_freq: 5000
 
+log_freq: 100
+
 wandb:
-  enable: false
-  project: "smolvla_finetuning"
+  enable: true
+  project: "smolvla_finetuning_kortex_v1"
+  mode: "offline"

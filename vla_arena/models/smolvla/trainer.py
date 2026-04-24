@@ -27,6 +27,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import csv
 import logging
 import time
 from contextlib import nullcontext
@@ -137,6 +138,10 @@ def train(cfg: TrainPipelineConfig):
 
     # Check device is available
     device = get_safe_torch_device(cfg.policy.device, log=True)
+    if device.type == 'cuda':
+        logging.info('Initializing CUDA (first call may take 30-60s on HPC)...')
+        torch.zeros(1, device=device)
+        logging.info(f'CUDA ready: {torch.cuda.get_device_name(device)}')
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
 
@@ -235,6 +240,13 @@ def train(cfg: TrainPipelineConfig):
         initial_step=step,
     )
 
+    csv_log_path = Path(cfg.output_dir) / 'training_log.csv'
+    csv_log_path.parent.mkdir(parents=True, exist_ok=True)
+    csv_file = open(csv_log_path, 'w', newline='')
+    csv_writer = csv.writer(csv_file)
+    csv_writer.writerow(['step', 'loss', 'grad_norm', 'lr', 'update_s', 'dataloading_s'])
+    logging.info(f'Training log CSV: {csv_log_path}')
+
     logging.info('Start offline training on a fixed dataset')
     for _ in range(step, cfg.steps):
         start_time = time.perf_counter()
@@ -268,6 +280,15 @@ def train(cfg: TrainPipelineConfig):
 
         if is_log_step:
             logging.info(train_tracker)
+            csv_writer.writerow([
+                step,
+                f'{train_tracker.loss.avg:.6f}',
+                f'{train_tracker.grad_norm.avg:.4f}',
+                f'{optimizer.param_groups[0]["lr"]:.2e}',
+                f'{train_tracker.update_s.avg:.3f}',
+                f'{train_tracker.dataloading_s.avg:.3f}',
+            ])
+            csv_file.flush()
             if wandb_logger:
                 wandb_log_dict = train_tracker.to_dict()
                 if output_dict:
@@ -334,6 +355,7 @@ def train(cfg: TrainPipelineConfig):
                     eval_info['video_paths'][0], step, mode='eval'
                 )
 
+    csv_file.close()
     if eval_env:
         eval_env.close()
     logging.info('End of training')
@@ -343,6 +365,8 @@ def train(cfg: TrainPipelineConfig):
 
 
 def main(config: TrainPipelineConfig | str | Path):
+    init_logging()
+
     # [Config Parsing] Handle cases where config is a path
     if isinstance(config, (str, Path)):
         config_path = Path(config)
